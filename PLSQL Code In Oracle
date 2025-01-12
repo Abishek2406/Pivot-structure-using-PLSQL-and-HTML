@@ -1,0 +1,232 @@
+CREATE OR REPLACE PROCEDURE GC_CONVERT_PIVOT_REPORT(
+    COMPANY IN VARCHAR2,
+    BRANCH IN VARCHAR2,
+    SFINYEAR IN VARCHAR2,
+    USERNAME IN VARCHAR2,
+    USER_ROLE IN VARCHAR2,
+    IN_DROP_YR_N IN VARCHAR2
+) IS
+    LP INT := 0;
+    PARENT_COL VARCHAR2(4000) := '';
+    CHILD_COL VARCHAR2(4000) := '';
+    TD_HTML VARCHAR2(4000) := '';
+    COL_DT_TYPE VARCHAR2(4000) := '';
+    PIVOT_CASE_COL VARCHAR2(4000) := '';
+    UPDATE_EJS_COL VARCHAR2(4000) := '';
+    
+    DONE_CUR1 BOOLEAN := FALSE;
+    VALUE VARCHAR2(4000);
+    TRSECODNHTML1 VARCHAR2(4000);
+    TRSECODNHTML2 VARCHAR2(4000);
+    TPL_UPDATE_COLUMN_ONE VARCHAR2(4000);
+    TPL_UPDATE_COLUMN_TWO VARCHAR2(4000);
+    COLUMN_VAL2 VARCHAR2(4000);
+    PIVOTCOLMBTWO VARCHAR2(4000);
+    COLSPAN INT;
+    
+    DDL_CRT_TAB VARCHAR2(4000);
+    DDP_DROP VARCHAR2(60);
+    INSERT_VALUE VARCHAR2(4000);
+    COL_SPAN_VAL INT := 2;
+    
+    CUR1 SYS_REFCURSOR;
+    
+    PROCEDURE STRING_TO_ARRAY(
+        P_STRING IN VARCHAR2,
+        P_DELIMITER IN VARCHAR2,
+        P_OUTPUT OUT CLOB
+    ) IS
+        L_STRING VARCHAR2(4000) := P_STRING;
+        L_DELIMITER VARCHAR2(10) := P_DELIMITER;
+        L_POS INT := 1;
+        L_SUBSTRING VARCHAR2(4000);
+        L_END_POS INT;
+        L_START_POS INT := 1;
+        L_TEMP_SET CLOB := '';
+    BEGIN
+        P_OUTPUT := '';
+        
+        WHILE L_START_POS <= LENGTH(L_STRING) LOOP
+            L_END_POS := INSTR(L_STRING, L_DELIMITER, L_START_POS);
+            
+            IF L_END_POS = 0 THEN
+                L_SUBSTRING := SUBSTR(L_STRING, L_START_POS);
+                L_SUBSTRING := TRIM(REPLACE(L_SUBSTRING, '\r\n', ''));
+                
+                IF INSTR(L_TEMP_SET, L_SUBSTRING) = 0 THEN
+                    P_OUTPUT := P_OUTPUT || L_SUBSTRING || ',';
+                    L_TEMP_SET := L_TEMP_SET || L_SUBSTRING || ',';
+                END IF;
+                L_START_POS := LENGTH(L_STRING) + 1;
+            ELSE
+                L_SUBSTRING := SUBSTR(L_STRING, L_START_POS, L_END_POS - L_START_POS);
+                L_SUBSTRING := TRIM(REPLACE(L_SUBSTRING, '\r\n', ''));
+                
+                IF INSTR(L_TEMP_SET, L_SUBSTRING) = 0 THEN
+                    P_OUTPUT := P_OUTPUT || L_SUBSTRING || ',';
+                    L_TEMP_SET := L_TEMP_SET || L_SUBSTRING || ',';
+                END IF;
+                L_START_POS := L_END_POS + LENGTH(L_DELIMITER);
+            END IF;
+        END LOOP;
+    END STRING_TO_ARRAY;
+    
+    FUNCTION F_STRING_TO_ARRAY(
+        F_STRING IN VARCHAR2,
+        F_DELIMITER IN VARCHAR2
+    ) RETURN STRING_TABLE IS  
+        MY_VAR STRING_TABLE;
+    BEGIN
+        STRING_TO_ARRAY(F_STRING, F_DELIMITER, MY_VAR);
+        RETURN MY_VAR;
+    END F_STRING_TO_ARRAY;
+    
+BEGIN
+    OPEN CUR1 FOR
+        WITH MonthData AS (
+            SELECT REPLACE(COLUMN_VALUE, '\\', '') AS metric
+            FROM JSON_TABLE(
+                F_STRING_TO_ARRAY(
+                    (SELECT LISTAGG(
+                        CONCAT(
+                            'COUNT(CASE WHEN TO_CHAR(o.taskdate, ''Month'') = "', TO_CHAR(o.taskdate, 'Month'), '" THEN o.opportunityid ELSE 0 END) AS oppo_', TO_CHAR(o.taskdate, 'Month'), ',',
+                            'SUM(CASE WHEN TO_CHAR(o.closedate, ''Month'') = "', TO_CHAR(o.taskdate, 'Month'), '" THEN o.actualamount ELSE 0 END) AS amount_', TO_CHAR(o.taskdate, 'Month')
+                        ) ORDER BY EXTRACT(MONTH FROM o.taskdate) SEPARATOR ',' 
+                    ) AS month_val
+                    FROM opportunity o
+                    JOIN control c ON o.companyid = c.controlid
+                    JOIN branchmast b ON o.branchid = b.branchmastid
+                    JOIN employeebasic e ON o.assignedtouser = e.employeebasicid
+                    WHERE c.companyname = COMPANY
+                    AND (b.branchid = BRANCH OR 'ALL BRANCHES' = BRANCH)
+                    AND o.finyr = SFINYEAR
+                    AND UPPER(e.loginid) = UPPER(USERNAME)
+                    AND (UPPER(USER_ROLE) = 'CRM' OR UPPER(USER_ROLE) = 'Management')
+                    AND EXTRACT(MONTH FROM o.taskdate) BETWEEN 10 AND 12
+                ), ','), '$[*]' COLUMNS (COLUMN_VALUE VARCHAR2(4000) PATH '$')
+            ) AS jt
+        ),
+        MonthNames AS (
+            SELECT jt.COLUMN_VALUE AS month
+            FROM JSON_TABLE(
+                F_STRING_TO_ARRAY(
+                    (SELECT LISTAGG(DISTINCT TO_CHAR(o.taskdate, 'Month') ORDER BY EXTRACT(MONTH FROM o.taskdate) SEPARATOR ',') AS month_val
+                    FROM opportunity o
+                    JOIN control c ON o.companyid = c.controlid
+                    JOIN branchmast b ON o.branchid = b.branchmastid
+                    JOIN employeebasic e ON o.assignedtouser = e.employeebasicid
+                    WHERE c.companyname = COMPANY
+                    AND (b.branchid = BRANCH OR 'ALL BRANCHES' = BRANCH)
+                    AND o.finyr = SFINYEAR
+                    AND UPPER(e.loginid) = UPPER(USERNAME)
+                    AND (UPPER(USER_ROLE) = 'CRM' OR UPPER(USER_ROLE) = 'Management')
+                    AND EXTRACT(MONTH FROM o.taskdate) BETWEEN 10 AND 12
+                    ), ','), '$[*]' COLUMNS (COLUMN_VALUE VARCHAR2(4000) PATH '$')
+            ) AS jt
+        ),
+        query_val AS (
+            SELECT mn.month AS months,
+                   LISTAGG(md.metric, ',') AS metric
+            FROM MonthNames mn
+            JOIN MonthData md ON INSTR(md.metric, mn.month) > 0
+            GROUP BY mn.month
+            ORDER BY TO_DATE(mn.month, 'Month')
+        )
+        SELECT months AS value,
+               CONCAT('', ' Number of Opp') AS trsecodnhtml1,
+               CONCAT('', ' Probable Sales') AS trsecodnhtml2,
+               LOWER(CONCAT('PIVOT_COUNT_', REPLACE(SUBSTR(months, 1, 3), ' ', ''))) AS tpl_update_column_one,
+               LOWER(CONCAT('PIVOT_SUM_', REPLACE(SUBSTR(months, 1, 3), ' ', ''))) AS tpl_update_column_two,
+               CONCAT(
+                   LOWER(CONCAT('PIVOT_COUNT_', REPLACE(SUBSTR(months, 1, 3), ' ', ''), ' INT')), ',',
+                   LOWER(CONCAT('PIVOT_SUM_', REPLACE(SUBSTR(months, 1, 3), ' ', ''), ' INT'))
+               ) AS column_val2,
+               metric AS pivotcolmbtwo,
+               2 AS colspan
+        FROM query_val;
+    
+    LOOP
+        FETCH CUR1 INTO VALUE, TRSECODNHTML1, TRSECODNHTML2, TPL_UPDATE_COLUMN_ONE, TPL_UPDATE_COLUMN_TWO, 
+                         COLUMN_VAL2, PIVOTCOLMBTWO, COLSPAN;
+                         
+        EXIT WHEN CUR1%NOTFOUND;
+        
+        LP := LP + 1;
+        COL_SPAN_VAL := COL_SPAN_VAL + COLSPAN;
+        
+        IF LP = 1 THEN
+            PARENT_COL := CONCAT('<th colspan="2" style="padding: 8px; text-align: center; background: #FF5858; color: white; border: 1px solid #ddd; font-weight: bold;">', VALUE, '</th>');
+            CHILD_COL := CONCAT('<th style="padding: 8px; text-align: center; background: #FF5858; color: white; border: 1px solid #ddd; font-weight: bold;">', TRSECODNHTML1, '</th>',
+                                '<th style="padding: 8px; text-align: center; background: #FF5858; color: white; border: 1px solid #ddd; font-weight: bold;">', TRSECODNHTML2, '</th>');
+            TD_HTML := CONCAT('<td style="padding: 8px; text-align: center; border: 1px solid #ddd;">{', TPL_UPDATE_COLUMN_ONE, '}</td>',
+                              '<td style="padding: 8px; text-align: center; border: 1px solid #ddd;">{', TPL_UPDATE_COLUMN_TWO, '}</td>');
+            COL_DT_TYPE := COLUMN_VAL2;
+            PIVOT_CASE_COL := PIVOTCOLMBTWO;
+            UPDATE_EJS_COL := CONCAT(TPL_UPDATE_COLUMN_ONE, ',', TPL_UPDATE_COLUMN_TWO);
+        ELSE
+            PARENT_COL := CONCAT(PARENT_COL, ' ', '<th colspan="2" style="padding: 8px; text-align: center; background: #FF5858; color: white; border: 1px solid #ddd; font-weight: bold;">', VALUE, '</th>');
+            CHILD_COL := CONCAT(CHILD_COL, ' ', 
+                                 '<th style="padding: 8px; text-align: center; background: #FF5858; color: white; border: 1px solid #ddd; font-weight: bold;">', TRSECODNHTML1, '</th>', 
+                                 '<th style="padding: 8px; text-align: center; background: #FF5858; color: white; border: 1px solid #ddd; font-weight: bold;">', TRSECODNHTML2, '</th>');
+            TD_HTML := CONCAT(TD_HTML, ' ', 
+                                 '<td style="padding: 8px; text-align: center; border: 1px solid #ddd;">{', TPL_UPDATE_COLUMN_ONE, '}</td>',
+                                 '<td style="padding: 8px; text-align: center; border: 1px solid #ddd;">{', TPL_UPDATE_COLUMN_TWO, '}</td>');
+            COL_DT_TYPE := CONCAT(COL_DT_TYPE, ',', COLUMN_VAL2);
+            PIVOT_CASE_COL := CONCAT(PIVOT_CASE_COL, ',', PIVOTCOLMBTWO);
+            UPDATE_EJS_COL := CONCAT(UPDATE_EJS_COL, ',', CONCAT(TPL_UPDATE_COLUMN_ONE, ',', TPL_UPDATE_COLUMN_TWO));
+        END IF;
+    END LOOP;
+    
+    CLOSE CUR1;
+    
+    DDL_CRT_TAB := 'CREATE TABLE grpcol_pivot_table (opp_age VARCHAR2(80), manager_name VARCHAR2(200), ' || COL_DT_TYPE || ')';
+    
+    IF IN_DROP_YR_N = 'YES' THEN
+        DDP_DROP := 'DROP TABLE grpcol_pivot_table';
+        EXECUTE IMMEDIATE DDP_DROP;
+    END IF;
+    
+    EXECUTE IMMEDIATE DDL_CRT_TAB;
+    
+    INSERT_VALUE := 'INSERT INTO grpcol_pivot_table (opp_age, manager_name, ' || PIVOT_CASE_COL || ') ' ||
+                   'SELECT o.oppage, o.accountmanager, ' || PIVOT_CASE_COL || ' FROM opportunity o ' ||
+                   'JOIN control c ON o.companyid = c.controlid ' ||
+                   'JOIN branchmast b ON o.branchid = b.branchmastid ' ||
+                   'JOIN employeebasic e ON o.assignedtouser = e.employeebasicid ' ||
+                   'JOIN employeebasic eb ON o.accmanager = eb.employeebasicid ' ||
+                   'JOIN oppsizemast om ON o.oppsize = om.oppsizemastid ' ||
+                   'JOIN leadsource l ON o.leadsource = l.leadsourceid ' ||
+                   'JOIN opportunitytype ot ON o.opportunitytype = ot.opportunitytypeid ' ||
+                   'WHERE c.companyname = ''' || COMPANY || ''' AND (b.branchid = ''' || BRANCH || ''' OR ''' || BRANCH || ''' = ''ALL BRANCHES'') ' ||
+                   'AND o.finyr = ''' || SFINYEAR || ''' AND UPPER(e.loginid) = UPPER(''' || USERNAME || ''') ' ||
+                   'AND (UPPER(USER_ROLE) = ''CRM'' OR UPPER(USER_ROLE) = ''Management'') AND EXTRACT(MONTH FROM o.taskdate) BETWEEN 10 AND 12 ' ||
+                   'ORDER BY 1, EXTRACT(MONTH FROM o.taskdate)';
+    
+    EXECUTE IMMEDIATE INSERT_VALUE;
+    
+    UPDATE ejsonsqlconfig
+    SET ejs_sql = 'SELECT opp_age, manager_name,' || UPDATE_EJS_COL || ' FROM grpcol_pivot_table'
+    WHERE ejsonsqlconfigid = 96;
+
+    UPDATE lp_tplbody
+    SET tplbody = '<div class="row"> <div class="col-md-12"> <table class="table table-striped table-hover" ' ||
+                  'style="border-collapse: collapse; font: 15px/1.4 Arial, Sans-serif; width: 100%; margin-bottom: 5px;"> ' ||
+                  '<colgroup> <col style="width: 25%;"> <col style="width: 25%;"> </colgroup> <thead> <tr> ' ||
+                  '<th colspan="' || COL_SPAN_VAL || '" style="padding: 8px; text-align: center; background: #FF5858; ' ||
+                  'color: white; border: 1px solid #ddd;"> <img src="https://img.icons8.com/?size=100&id=81980&format=png&color=000000" ' ||
+                  'style="height: 25px; width: 25px; margin-right: 3px;">Days in the Pipeline by Account Manager </th> </tr> ' ||
+                  '<tr style="font-size: 12px;"> <td rowspan="2" style="padding: 8px; text-align: center; ' ||
+                  'background: #FF5858; color: white; border: 1px solid #ddd; font-weight: bold;"> Opp Age </td> ' ||
+                  '<td rowspan="2" style="padding: 8px; text-align: center; background: #FF5858; color: white; ' ||
+                  'border: 1px solid #ddd; font-weight: bold;"> Account Manager </td>' || PARENT_COL || ' </tr> ' ||
+                  '<tr style="font-size: 11px;">' || CHILD_COL || ' </tr> </thead> <tbody> <tpl for="."> ' ||
+                  '<tr style="background: white; font-size: 11px; font-weight: bold;"> <th scope="row" ' ||
+                  'style="padding: 8px; text-align: center; color: rgb(35, 30, 30); border: 1px solid #ddd; ' ||
+                  'font-weight: bold;">{opp_age}</th> <th scope="row" style="padding: 8px; text-align: center; ' ||
+                  'color: rgb(35, 30, 30); border: 1px solid #ddd; font-weight: bold;">{manager_name}</th> ' ||
+                  TD_HTML || ' </tr> </tpl> </tbody> </table> </div> </div>'
+    WHERE lp_tplbodyid = 49;
+
+    COMMIT;
+END;
+/
